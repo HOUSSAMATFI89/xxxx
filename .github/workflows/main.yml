@@ -1,0 +1,148 @@
+name: houssam
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "How many hours to keep the session alive (max 6)"
+        required: false
+        default: "5"
+
+jobs:
+  houssam:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Show machine specs
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version
+          Get-CimInstance Win32_ComputerSystem | Select-Object @{n='RAM_GB';e={[math]::Round($_.TotalPhysicalMemory/1GB,1)}}, NumberOfLogicalProcessors
+
+      - name: Enable Remote Desktop
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+      - name: Set RDP user password
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          # Use the RDP_PASSWORD secret if it exists, otherwise generate a random one
+          $plain = $env:RDP_PASSWORD
+          if (-not $plain) {
+            $chars = (48..57) + (65..90) + (97..122) | ForEach-Object { [char]$_ }
+            $plain = "Aa1!" + (-join (1..14 | ForEach-Object { $chars | Get-Random }))
+            Write-Host "No RDP_PASSWORD secret found, generated a password."
+          }
+          $pw = ConvertTo-SecureString $plain -AsPlainText -Force
+          Set-LocalUser -Name "runneradmin" -Password $pw
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin" -ErrorAction SilentlyContinue
+          "RDP_PLAIN=$plain" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Create user houssam (password houssam)
+        shell: pwsh
+        run: |
+          # Relax password policy so a simple password is accepted
+          secedit /export /cfg "$env:RUNNER_TEMP\sec.cfg" | Out-Null
+          (Get-Content "$env:RUNNER_TEMP\sec.cfg") `
+            -replace 'PasswordComplexity = 1','PasswordComplexity = 0' `
+            -replace 'MinimumPasswordLength = \d+','MinimumPasswordLength = 0' |
+            Set-Content "$env:RUNNER_TEMP\sec.cfg"
+          secedit /configure /db "$env:RUNNER_TEMP\sec.sdb" /cfg "$env:RUNNER_TEMP\sec.cfg" /areas SECURITYPOLICY | Out-Null
+
+          net user houssam houssam /add
+          net localgroup Administrators houssam /add
+          net localgroup "Remote Desktop Users" houssam /add
+          net user houssam
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $msi = "$env:RUNNER_TEMP\tailscale.msi"
+          $installed = $false
+          # Official installer first (Chocolatey's server often times out)
+          foreach ($url in @(
+            "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi",
+            "https://pkgs.tailscale.com/stable/tailscale-setup-latest.msi")) {
+            for ($i = 1; $i -le 3 -and -not $installed; $i++) {
+              try {
+                Write-Host "Downloading $url (try $i)"
+                Invoke-WebRequest -Uri $url -OutFile $msi -TimeoutSec 120
+                $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+                if ($p.ExitCode -eq 0 -or $p.ExitCode -eq 3010) { $installed = $true }
+              } catch { Write-Host "Failed: $_"; Start-Sleep -Seconds 5 }
+            }
+            if ($installed) { break }
+          }
+          if (-not $installed) {
+            Write-Host "Falling back to Chocolatey"
+            choco install tailscale -y --no-progress
+          }
+          "C:\Program Files\Tailscale" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          Start-Sleep -Seconds 5
+          Get-Service Tailscale -ErrorAction SilentlyContinue | Start-Service
+          if (-not (Test-Path "C:\Program Files\Tailscale\tailscale.exe")) { throw "Tailscale install failed" }
+
+      - name: Tailscale login (open the link below)
+        shell: pwsh
+        run: |
+          $env:Path += ";C:\Program Files\Tailscale"
+          $out = "$env:RUNNER_TEMP\ts-out.txt"
+          $err = "$env:RUNNER_TEMP\ts-err.txt"
+
+          # 'tailscale up' prints a login URL and waits until you approve it.
+          Start-Process tailscale -ArgumentList "up","--hostname=gh-rdp","--unattended" `
+            -RedirectStandardOutput $out -RedirectStandardError $err -WindowStyle Hidden
+
+          $url = $null
+          for ($i = 0; $i -lt 30 -and -not $url; $i++) {
+            Start-Sleep -Seconds 2
+            $text = (Get-Content $out, $err -ErrorAction SilentlyContinue) -join "`n"
+            if ($text -match 'https://login\.tailscale\.com/\S+') { $url = $Matches[0] }
+          }
+          if (-not $url) { throw "Could not get a Tailscale login URL. Output: $text" }
+
+          Write-Host "============================================"
+          Write-Host " LOGIN LINK: $url"
+          Write-Host "============================================"
+          "### Tailscale login`n[Click here to log in]($url)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "TS_LOGIN_URL=$url" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          # Wait up to 10 minutes for you to approve the device
+          $ok = $false
+          for ($i = 0; $i -lt 120 -and -not $ok; $i++) {
+            Start-Sleep -Seconds 5
+            try {
+              $st = tailscale status --json | ConvertFrom-Json
+              if ($st.BackendState -eq "Running") { $ok = $true }
+            } catch {}
+            if (-not $ok -and ($i % 6 -eq 0)) { Write-Host "Waiting for login... $url" }
+          }
+          if (-not $ok) { throw "Tailscale login was not completed in time." }
+
+          $ip = (tailscale ip -4 | Select-Object -First 1).Trim()
+          Write-Host "============================================"
+          Write-Host " Tailscale IP : $ip"
+          Write-Host " Username     : houssam"
+          Write-Host " Password     : houssam"
+          Write-Host "============================================"
+          "RDP_ADDR=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "### RDP ready`nConnect to **$ip** as `houssam` (password `houssam`) (your device must be on the same tailnet)." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Keep session alive
+        shell: pwsh
+        run: |
+          $hours = [double]"${{ github.event.inputs.hours }}"
+          if ($hours -le 0 -or $hours -gt 6) { $hours = 6 }
+          $end = (Get-Date).AddHours($hours)
+          Write-Host "Session alive until $end (create a file C:\stop.txt to end early)"
+          while ((Get-Date) -lt $end) {
+            if (Test-Path "C:\stop.txt") { break }
+            Write-Host "RDP: $env:RDP_ADDR  |  time left: $([int]($end - (Get-Date)).TotalMinutes) min"
+            Start-Sleep -Seconds 60
+          }
